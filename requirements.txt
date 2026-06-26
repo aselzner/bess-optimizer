@@ -1,0 +1,11 @@
+# BESS Dispatch Optimizer — Python dependencies
+# Install with: pip install -r requirements.txt
+
+pandas>=2.0
+requests>=2.31
+pulp>=2.7          # LP solver (CBC bundled)
+matplotlib>=3.8
+pytz>=2024.1
+jupyter>=1.0
+notebook>=7.0
+ipykernel>=6.0
