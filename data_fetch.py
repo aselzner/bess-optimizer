@@ -1,25 +1,35 @@
 """
 data_fetch.py  —  BESS Dispatch Optimizer
 ==========================================
-Fetches NYISO Day-Ahead Market (DAM) Locational Marginal Prices (LMPs)
-from the public NYISO bulk-data portal and persists them to a local SQLite
+Fetches NYISO Day-Ahead Market (DAM) zonal Locational Based Marginal Prices
+(LBMPs) from the public NYISO MIS portal and persists them to a local SQLite
 database for use by the optimizer.
 
-NYISO public data URL pattern
-------------------------------
-    https://mis.nyiso.com/public/csv/damlbmp/{YYYYMMDD}damlbmp_zone_csv.zip
+NYISO public data URL patterns (dataset P-2A, DAM zonal LBMP)
+--------------------------------------------------------------
+    Monthly archive : https://mis.nyiso.com/public/csv/damlbmp/{YYYYMM}01damlbmp_zone_csv.zip
+                      (one CSV per day of the month inside the ZIP)
+    Single day      : https://mis.nyiso.com/public/csv/damlbmp/{YYYYMMDD}damlbmp_zone.csv
 
-Each ZIP contains one CSV per hour-ending interval:
-    Time Stamp, Name, PTID, Marginal Cost Losses, Marginal Cost Congestion,
-    DAM Zonal LBMP
+Past months are downloaded as one ZIP each; days in the current month fall
+back to the daily CSV files.
 
-This module exposes two public entry-points:
-    fetch_lmp(start, end, node, db_path)   → pd.DataFrame
-    load_lmp(start, end, node, db_path)    → pd.DataFrame  (DB-only, no HTTP)
+Each CSV has one row per zone per hour:
+    Time Stamp | Name | PTID | LBMP ($/MWHr) |
+    Marginal Cost Losses ($/MWHr) | Marginal Cost Congestion ($/MWHr)
+
+"Time Stamp" is hour-beginning, in Eastern Prevailing Time. It is stored as
+UTC. Date ranges in this module are NYISO market days (America/New_York).
+
+This module exposes the public entry-points:
+    fetch_lmp(start, end, node, db_path)        → pd.DataFrame
+    fetch_many(start, end, nodes, db_path)      → None (one download per month for all nodes)
+    load_lmp(start, end, node, db_path)         → pd.DataFrame  (DB-only, no HTTP)
 
 Usage
 -----
-    python data_fetch.py --start 2025-01-01 --end 2025-01-07 --node CAPITL
+    python data_fetch.py --start 2025-01-01 --end 2025-12-31 --node CAPITL
+    python data_fetch.py --start 2025-01-01 --end 2025-12-31 --nodes CAPITL N.Y.C. WEST
 """
 
 from __future__ import annotations
@@ -29,9 +39,9 @@ import io
 import logging
 import sqlite3
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 import requests
@@ -40,8 +50,11 @@ import requests
 # Public constants
 # ---------------------------------------------------------------------------
 
-#: Base URL for NYISO day-ahead LMP bulk downloads
+#: Base URL for NYISO day-ahead LBMP bulk downloads
 NYISO_DAM_BASE = "https://mis.nyiso.com/public/csv/damlbmp"
+
+#: NYISO market time zone (Eastern Prevailing Time)
+MARKET_TZ = "America/New_York"
 
 #: Default SQLite database path (relative to CWD)
 DEFAULT_DB = Path("bess_lmp.db")
@@ -115,8 +128,12 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP / parse helpers
+# Market-day helpers
 # ---------------------------------------------------------------------------
+
+def _as_date(d: date | str) -> date:
+    return date.fromisoformat(d) if isinstance(d, str) else d
+
 
 def _date_range(start: date, end: date):
     """Yield each date from start to end inclusive."""
@@ -126,90 +143,123 @@ def _date_range(start: date, end: date):
         cur += timedelta(days=1)
 
 
-def _build_url(day: date) -> str:
-    return f"{NYISO_DAM_BASE}/{day:%Y%m%d}damlbmp_zone_csv.zip"
+def _market_day_bounds_utc(start: date, end: date) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """UTC instants of local midnight on *start* and local midnight after *end*."""
+    lo = pd.Timestamp(start).tz_localize(MARKET_TZ).tz_convert("UTC")
+    hi = pd.Timestamp(end + timedelta(days=1)).tz_localize(MARKET_TZ).tz_convert("UTC")
+    return lo, hi
 
 
-def _parse_zip(content: bytes, node: str) -> pd.DataFrame:
+def _hours_in_market_day(day: date) -> int:
+    """23 on the spring-forward day, 25 on the fall-back day, else 24."""
+    lo, hi = _market_day_bounds_utc(day, day)
+    return int((hi - lo) / pd.Timedelta("1h"))
+
+
+# ---------------------------------------------------------------------------
+# HTTP / parse helpers
+# ---------------------------------------------------------------------------
+
+def _monthly_zip_url(month_start: date) -> str:
+    return f"{NYISO_DAM_BASE}/{month_start:%Y%m}01damlbmp_zone_csv.zip"
+
+
+def _daily_csv_url(day: date) -> str:
+    return f"{NYISO_DAM_BASE}/{day:%Y%m%d}damlbmp_zone.csv"
+
+
+def _find_col(columns: Iterable[str], *needles: str) -> Optional[str]:
+    """First column whose lower-cased name contains all *needles*."""
+    for col in columns:
+        low = col.lower()
+        if all(n in low for n in needles):
+            return col
+    return None
+
+
+def _parse_csv(raw: pd.DataFrame, nodes: Optional[set[str]] = None) -> pd.DataFrame:
     """
-    Parse a NYISO DAM LMP ZIP archive.
+    Normalise one NYISO DAM zonal LBMP CSV.
 
-    The ZIP holds one or more CSV files named like:
-        20250101damlbmp_zone_20250101T0000.csv
+    Column names are matched loosely ("LBMP ($/MWHr)", "DAM Zonal LBMP",
+    "Marginal Cost Losses ($/MWHr)", ...) because NYISO has changed the
+    exact labels over time.
 
-    Each CSV has columns:
-        Time Stamp | Name | PTID | Marginal Cost Losses |
-        Marginal Cost Congestion | DAM Zonal LBMP
-
-    Returns a DataFrame with columns:
-        interval_start (tz-aware UTC Timestamp), node, lmp, mcl, mcc
+    Returns columns: interval_start (UTC), node, lmp, mcl, mcc
     """
-    frames: list[pd.DataFrame] = []
-    node_upper = node.upper()
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
-        if not csv_names:
-            raise ValueError("ZIP archive contains no CSV files.")
+    ts_col = _find_col(df.columns, "time stamp") or _find_col(df.columns, "timestamp")
+    name_col = _find_col(df.columns, "name")
+    mcl_col = _find_col(df.columns, "losses")
+    mcc_col = _find_col(df.columns, "congestion")
+    lmp_col = next(
+        (c for c in df.columns if "lbmp" in c.lower() and c not in (mcl_col, mcc_col)),
+        None,
+    )
+    if not (ts_col and name_col and lmp_col):
+        raise ValueError(f"Unrecognised NYISO CSV columns: {list(df.columns)}")
 
-        for csv_name in csv_names:
-            with zf.open(csv_name) as fh:
-                df = pd.read_csv(fh, parse_dates=["Time Stamp"])
+    out = pd.DataFrame(
+        {
+            "local_ts": pd.to_datetime(df[ts_col], format="%m/%d/%Y %H:%M", errors="coerce"),
+            "node": df[name_col].astype(str).str.strip().str.upper(),
+            "lmp": pd.to_numeric(df[lmp_col], errors="coerce"),
+            "mcl": pd.to_numeric(df[mcl_col], errors="coerce") if mcl_col else float("nan"),
+            "mcc": pd.to_numeric(df[mcc_col], errors="coerce") if mcc_col else float("nan"),
+        }
+    )
+    if out["local_ts"].isna().all():                       # other timestamp layouts
+        out["local_ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+    out = out.dropna(subset=["local_ts", "lmp"])
 
-            # Normalise column names
-            df.columns = [c.strip() for c in df.columns]
-            rename = {
-                "Time Stamp": "interval_start",
-                "Name": "node",
-                "DAM Zonal LBMP": "lmp",
-                "Marginal Cost Losses": "mcl",
-                "Marginal Cost Congestion": "mcc",
-            }
-            df = df.rename(columns=rename)
-
-            # Filter to requested node
-            mask = df["node"].str.upper() == node_upper
-            df = df[mask].copy()
-
-            if df.empty:
-                continue
-
-            # NYISO timestamps are Eastern; convert to UTC
-            df["interval_start"] = (
-                df["interval_start"]
-                .dt.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-                .dt.tz_convert("UTC")
-            )
-
-            frames.append(df[["interval_start", "node", "lmp", "mcl", "mcc"]])
-
-    if not frames:
+    if nodes is not None:
+        out = out[out["node"].isin(nodes)]
+    if out.empty:
         return pd.DataFrame(columns=["interval_start", "node", "lmp", "mcl", "mcc"])
 
-    result = pd.concat(frames, ignore_index=True)
-    result["node"] = result["node"].str.upper()
-    result = result.sort_values("interval_start").drop_duplicates(
+    # Hour-beginning Eastern time → UTC. On the fall-back day the 01:00 hour
+    # appears twice per zone; "infer" uses the row order to tell them apart,
+    # so localise each zone separately, in file order.
+    parts = []
+    for _, grp in out.groupby("node", sort=False):
+        grp = grp.copy()
+        grp["interval_start"] = (
+            grp["local_ts"]
+            .dt.tz_localize(MARKET_TZ, ambiguous="infer", nonexistent="shift_forward")
+            .dt.tz_convert("UTC")
+        )
+        parts.append(grp)
+    out = pd.concat(parts, ignore_index=True)
+
+    out = out.sort_values(["node", "interval_start"]).drop_duplicates(
         subset=["interval_start", "node"]
     )
-    return result
+    return out[["interval_start", "node", "lmp", "mcl", "mcc"]].reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Core fetch logic
-# ---------------------------------------------------------------------------
+def _parse_zip(content: bytes, nodes: Optional[set[str]] = None) -> pd.DataFrame:
+    """Parse a NYISO monthly ZIP archive (one CSV per day)."""
+    frames: list[pd.DataFrame] = []
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        csv_names = sorted(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        if not csv_names:
+            raise ValueError("ZIP archive contains no CSV files.")
+        for csv_name in csv_names:
+            with zf.open(csv_name) as fh:
+                frames.append(_parse_csv(pd.read_csv(fh), nodes))
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame(columns=["interval_start", "node", "lmp", "mcl", "mcc"])
+    return pd.concat(frames, ignore_index=True)
 
-def _fetch_day(
-    day: date,
-    node: str,
-    session: requests.Session,
-    timeout: int = 30,
-) -> pd.DataFrame:
-    """Download and parse a single day's DAM LMP ZIP for *node*."""
-    url = _build_url(day)
+
+def _get(session: requests.Session, url: str, timeout: int) -> bytes:
     log.info("GET %s", url)
     resp = session.get(url, timeout=timeout)
     resp.raise_for_status()
-    return _parse_zip(resp.content, node)
+    return resp.content
 
 
 def _upsert(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
@@ -217,7 +267,7 @@ def _upsert(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     if df.empty:
         return 0
 
-    fetched_at = datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = [
         (
             row.interval_start.isoformat(),
@@ -248,32 +298,100 @@ def _missing_days(
     node: str,
 ) -> list[date]:
     """
-    Return days in [start, end] that have fewer than 24 rows in the DB
-    for *node* (i.e., incomplete or absent).
+    Return NYISO market days in [start, end] that are incomplete or absent
+    in the DB for *node* (23 or 25 hours expected on DST change days).
     """
-    missing = []
-    node_upper = node.upper()
-    for day in _date_range(start, end):
-        day_start = datetime(day.year, day.month, day.day).isoformat()
-        next_day = day + timedelta(days=1)
-        day_end = datetime(next_day.year, next_day.month, next_day.day).isoformat()
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM lmp
-            WHERE node = ?
-              AND interval_start >= ?
-              AND interval_start <  ?
-            """,
-            (node_upper, day_start, day_end),
-        ).fetchone()
-        if row["cnt"] < 24:
-            missing.append(day)
-    return missing
+    lo, hi = _market_day_bounds_utc(start, end)
+    rows = conn.execute(
+        """
+        SELECT interval_start FROM lmp
+        WHERE node = ? AND interval_start >= ? AND interval_start < ?
+        """,
+        (node.upper(), lo.isoformat(), hi.isoformat()),
+    ).fetchall()
+    have = pd.Series(
+        pd.to_datetime([r["interval_start"] for r in rows], utc=True), dtype="datetime64[ns, UTC]"
+    )
+    counts = have.dt.tz_convert(MARKET_TZ).dt.date.value_counts()
+    return [d for d in _date_range(start, end) if counts.get(d, 0) < _hours_in_market_day(d)]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def fetch_many(
+    start: date | str,
+    end: date | str,
+    nodes: Iterable[str] = ("CAPITL",),
+    db_path: Path | str = DEFAULT_DB,
+    force_refresh: bool = False,
+    timeout: int = 60,
+) -> None:
+    """
+    Fetch NYISO day-ahead LBMPs for several zones in one pass.
+
+    Past months are downloaded once as a monthly ZIP (it contains every zone),
+    so fetching a year for three zones takes about 12 requests, not 1,095.
+    Days in a month whose archive is not published yet are fetched from the
+    daily CSV files. Only missing or incomplete days are downloaded unless
+    *force_refresh* is True.
+    """
+    start, end = _as_date(start), _as_date(end)
+    if start > end:
+        raise ValueError(f"start ({start}) must be <= end ({end})")
+    node_set = {n.upper() for n in nodes}
+
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect(db_path)
+    _init_db(conn)
+
+    if force_refresh:
+        todo = set(_date_range(start, end))
+    else:
+        todo = set()
+        for node in node_set:
+            todo.update(_missing_days(conn, start, end, node))
+    if not todo:
+        log.info("All days cached for %s — no HTTP requests needed.", sorted(node_set))
+        conn.close()
+        return
+
+    today_local = pd.Timestamp.now(tz=MARKET_TZ).date()
+    months = sorted({date(d.year, d.month, 1) for d in todo})
+    log.info("Fetching %d day(s) across %d month(s) for %s", len(todo), len(months), sorted(node_set))
+
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "BESS-Optimizer/1.0 (research)"})
+        for month in months:
+            month_days = sorted(d for d in todo if (d.year, d.month) == (month.year, month.month))
+            next_month = date(month.year + month.month // 12, month.month % 12 + 1, 1)
+            month_complete = next_month <= today_local
+
+            if month_complete:
+                try:
+                    df = _parse_zip(_get(session, _monthly_zip_url(month), timeout), node_set)
+                    log.info("  %s → %d rows stored", f"{month:%Y-%m}", _upsert(conn, df))
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("  %s monthly ZIP failed (%s) — trying daily files", f"{month:%Y-%m}", exc)
+
+            for day in month_days:
+                try:
+                    raw = pd.read_csv(io.BytesIO(_get(session, _daily_csv_url(day), timeout)))
+                    log.info("  %s → %d rows stored", day, _upsert(conn, _parse_csv(raw, node_set)))
+                except requests.HTTPError as exc:
+                    log.warning("  %s → HTTP %s (skipped)", day, exc.response.status_code)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("  %s → error: %s (skipped)", day, exc)
+
+    for node in sorted(node_set):
+        gaps = _missing_days(conn, start, end, node)
+        if gaps:
+            log.warning("%s: %d day(s) still incomplete, e.g. %s", node, len(gaps), gaps[:3])
+    conn.close()
+
 
 def fetch_lmp(
     start: date | str,
@@ -281,18 +399,15 @@ def fetch_lmp(
     node: str = "CAPITL",
     db_path: Path | str = DEFAULT_DB,
     force_refresh: bool = False,
-    timeout: int = 30,
+    timeout: int = 60,
 ) -> pd.DataFrame:
     """
-    Fetch NYISO day-ahead LMPs for *node* between *start* and *end* inclusive.
-
-    Data is cached in SQLite at *db_path*.  Only missing / incomplete days are
-    downloaded from NYISO; subsequent calls are served from the local cache.
+    Fetch NYISO day-ahead LBMPs for one zone and return them from the cache.
 
     Parameters
     ----------
     start, end : date or "YYYY-MM-DD" string
-        Inclusive date range to fetch.
+        Inclusive range of NYISO market days.
     node : str
         NYISO zone name (e.g. "CAPITL", "N.Y.C.", "LONGIL").
     db_path : Path or str
@@ -308,41 +423,7 @@ def fetch_lmp(
         Columns: interval_start (UTC Timestamp), node, lmp, mcl, mcc
         Sorted by interval_start ascending.
     """
-    if isinstance(start, str):
-        start = date.fromisoformat(start)
-    if isinstance(end, str):
-        end = date.fromisoformat(end)
-    if start > end:
-        raise ValueError(f"start ({start}) must be <= end ({end})")
-
-    db_path = Path(db_path)
-    conn = _connect(db_path)
-    _init_db(conn)
-
-    if force_refresh:
-        days_to_fetch = list(_date_range(start, end))
-    else:
-        days_to_fetch = _missing_days(conn, start, end, node)
-
-    if days_to_fetch:
-        log.info(
-            "Fetching %d day(s) from NYISO for node=%s", len(days_to_fetch), node
-        )
-        with requests.Session() as session:
-            session.headers.update({"User-Agent": "BESS-Optimizer/1.0 (research)"})
-            for day in days_to_fetch:
-                try:
-                    df_day = _fetch_day(day, node, session, timeout=timeout)
-                    written = _upsert(conn, df_day)
-                    log.info("  %s → %d rows stored", day, written)
-                except requests.HTTPError as exc:
-                    log.warning("  %s → HTTP %s (skipped)", day, exc.response.status_code)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("  %s → error: %s (skipped)", day, exc)
-    else:
-        log.info("All days cached for node=%s — no HTTP requests needed.", node)
-
-    conn.close()
+    fetch_many(start, end, [node], db_path, force_refresh=force_refresh, timeout=timeout)
     return load_lmp(start, end, node, db_path)
 
 
@@ -353,34 +434,24 @@ def load_lmp(
     db_path: Path | str = DEFAULT_DB,
 ) -> pd.DataFrame:
     """
-    Load cached LMP data from SQLite without making any HTTP requests.
+    Load cached LBMP data from SQLite without making any HTTP requests.
 
-    Parameters
-    ----------
-    start, end : date or "YYYY-MM-DD" string
-    node : str
-    db_path : Path or str
+    *start* and *end* are inclusive NYISO market days (America/New_York),
+    so a day always runs from local midnight to local midnight.
 
     Returns
     -------
     pd.DataFrame
         Columns: interval_start (UTC Timestamp), node, lmp, mcl, mcc
     """
-    if isinstance(start, str):
-        start = date.fromisoformat(start)
-    if isinstance(end, str):
-        end = date.fromisoformat(end)
-
+    start, end = _as_date(start), _as_date(end)
     db_path = Path(db_path)
     if not db_path.exists():
         raise FileNotFoundError(
             f"Database not found: {db_path}. Run fetch_lmp() first."
         )
 
-    # end is inclusive → extend one day for the < comparison
-    end_exclusive = end + timedelta(days=1)
-    node_upper = node.upper()
-
+    lo, hi = _market_day_bounds_utc(start, end)
     conn = _connect(db_path)
     df = pd.read_sql_query(
         """
@@ -392,11 +463,7 @@ def load_lmp(
         ORDER  BY interval_start ASC
         """,
         conn,
-        params=(
-            node_upper,
-            datetime(start.year, start.month, start.day).isoformat(),
-            datetime(end_exclusive.year, end_exclusive.month, end_exclusive.day).isoformat(),
-        ),
+        params=(node.upper(), lo.isoformat(), hi.isoformat()),
     )
     conn.close()
 
@@ -438,15 +505,15 @@ def generate_mock_lmp(
     if isinstance(end, str):
         end = date.fromisoformat(end)
 
-    periods = int((end - start).days + 1) * 24
-    idx = pd.date_range(
-        start=datetime(start.year, start.month, start.day, tzinfo=__import__("pytz").utc),
-        periods=periods,
-        freq="h",
-    )
+    # One row per hour of each NYISO market day (local midnight to midnight),
+    # so DST days get 23 or 25 hours, like the real data.
+    lo, hi = _market_day_bounds_utc(start, end)
+    idx = pd.date_range(start=lo, end=hi, freq="h", inclusive="left")
+    periods = len(idx)
 
-    hours = idx.hour
-    weekday = idx.dayofweek  # 0=Mon … 6=Sun
+    local = idx.tz_convert(MARKET_TZ)
+    hours = local.hour
+    weekday = local.dayofweek  # 0=Mon … 6=Sun
 
     # Base shape: two humps
     base = (
@@ -490,6 +557,10 @@ def generate_mock_lmp(
 
 # ---------------------------------------------------------------------------
 # CLI
+
+
+# ---------------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------------
 
 def _cli() -> None:
@@ -500,49 +571,38 @@ def _cli() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Fetch NYISO day-ahead LMP data into SQLite",
+        description="Fetch NYISO day-ahead zonal LBMP data into SQLite",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--start", required=True, metavar="YYYY-MM-DD", help="First day to fetch"
-    )
-    parser.add_argument(
-        "--end", required=True, metavar="YYYY-MM-DD", help="Last day to fetch (inclusive)"
-    )
-    parser.add_argument(
-        "--node", default="CAPITL", choices=NYISO_ZONES, help="NYISO zone name"
-    )
-    parser.add_argument(
-        "--db", default=str(DEFAULT_DB), metavar="PATH", help="SQLite database path"
-    )
-    parser.add_argument(
-        "--force", action="store_true", help="Re-download all days, ignoring cache"
-    )
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Generate synthetic data instead of fetching from NYISO (for testing)",
-    )
+    parser.add_argument("--start", required=True, metavar="YYYY-MM-DD", help="First market day")
+    parser.add_argument("--end", required=True, metavar="YYYY-MM-DD", help="Last market day (inclusive)")
+    parser.add_argument("--node", default="CAPITL", choices=NYISO_ZONES, help="NYISO zone name")
+    parser.add_argument("--nodes", nargs="+", choices=NYISO_ZONES, metavar="ZONE",
+                        help="Several zones at once (overrides --node)")
+    parser.add_argument("--db", default=str(DEFAULT_DB), metavar="PATH", help="SQLite database path")
+    parser.add_argument("--force", action="store_true", help="Re-download all days, ignoring cache")
+    parser.add_argument("--mock", action="store_true",
+                        help="Generate synthetic data instead of fetching from NYISO (for testing)")
     args = parser.parse_args()
+    nodes = args.nodes or [args.node]
 
-    if args.mock:
-        df = generate_mock_lmp(args.start, args.end, args.node, args.db)
-        print(f"\n[mock] Generated {len(df)} rows")
-    else:
-        df = fetch_lmp(args.start, args.end, args.node, args.db, force_refresh=args.force)
+    for node in nodes:
+        if args.mock:
+            generate_mock_lmp(args.start, args.end, node, args.db)
+    if not args.mock:
+        fetch_many(args.start, args.end, nodes, args.db, force_refresh=args.force)
 
-    if df.empty:
-        print("No data returned — check node name and date range.")
-        return
-
-    # Summary statistics
-    print(f"\n{'='*55}")
-    print(f"  Node : {args.node}")
-    print(f"  Range: {args.start} → {args.end}")
-    print(f"  Rows : {len(df):,}")
-    print(f"{'='*55}")
-    print(df[["interval_start", "lmp"]].describe().to_string())
-    print(f"\nFirst 5 rows:\n{df.head().to_string(index=False)}")
+    for node in nodes:
+        df = load_lmp(args.start, args.end, node, args.db)
+        if df.empty:
+            print(f"{node}: no data returned — check node name and date range.")
+            continue
+        print(f"\n{'='*55}")
+        print(f"  Node : {node}")
+        print(f"  Range: {args.start} → {args.end}")
+        print(f"  Rows : {len(df):,}")
+        print(f"{'='*55}")
+        print(df["lmp"].describe().to_string())
 
 
 if __name__ == "__main__":
