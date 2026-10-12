@@ -31,7 +31,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
-from data_fetch import DEFAULT_DB, generate_mock_lmp, load_lmp
+from data_fetch import DEFAULT_DB, MARKET_TZ, generate_mock_lmp, load_lmp
 from optimizer import BatteryConfig, OptimResult, solve_rolling
 
 log = logging.getLogger(__name__)
@@ -45,6 +45,16 @@ C_LMP       = "#534AB7"   # purple — price line
 C_POS       = "#3B6D11"   # green — positive revenue
 C_NEG       = "#A32D2D"   # red   — negative revenue
 C_CUM       = "#185FA5"   # blue  — cumulative line
+
+
+def _to_market_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy of *df* with interval_start in NYISO local time (tz-naive, for plotting)."""
+    out = df.copy()
+    ts = pd.to_datetime(out["interval_start"])
+    if ts.dt.tz is None:                      # older results stored naive UTC
+        ts = ts.dt.tz_localize("UTC")
+    out["interval_start"] = ts.dt.tz_convert(MARKET_TZ).dt.tz_localize(None)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +74,7 @@ def plot_dispatch(
       ax_power  — stacked charge (negative) / discharge (positive) bars
       ax_soc    — state-of-charge fill with bounds
     """
-    df  = result.dispatch
+    df  = _to_market_time(result.dispatch)
     cfg = result.config
     ts  = df["interval_start"]
     dt  = pd.Timedelta("50min")   # bar width
@@ -108,7 +118,7 @@ def plot_dispatch(
     ax_soc.axhline(cfg.e_max, color="gray", lw=0.7, ls=":",
                    label=f"Max {cfg.e_max:.0f} MWh")
     ax_soc.set_ylabel("SoC (MWh)", fontsize=9)
-    ax_soc.set_xlabel("Hour (UTC)", fontsize=9)
+    ax_soc.set_xlabel("Market day (Eastern time)", fontsize=9)
     ax_soc.set_ylim(0, cfg.energy_mwh * 1.05)
     ax_soc.legend(fontsize=8, loc="upper right")
     ax_soc.grid(axis="y", alpha=0.25, lw=0.5)
@@ -141,7 +151,7 @@ def figure_dispatch(result: OptimResult) -> plt.Figure:
 
 def figure_pnl(result: OptimResult) -> plt.Figure:
     df = result.dispatch.copy()
-    df["date"] = df["interval_start"].dt.date
+    df["date"] = _to_market_time(df)["interval_start"].dt.date
 
     daily = df.groupby("date").agg(
         revenue    = ("revenue_$",    "sum"),
@@ -287,7 +297,7 @@ def figure_price_vs_dispatch(result: OptimResult) -> plt.Figure:
 def figure_stats_table(result: OptimResult) -> plt.Figure:
     df  = result.dispatch.copy()
     cfg = result.config
-    df["date"] = df["interval_start"].dt.date
+    df["date"] = _to_market_time(df)["interval_start"].dt.date
 
     daily = df.groupby("date").agg(
         revenue   = ("revenue_$",    "sum"),
