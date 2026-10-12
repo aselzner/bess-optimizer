@@ -1,0 +1,22 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data and scratch output (regenerate with data_fetch.py / run_backtest.py)
+*.db
+*.db-wal
+*.db-shm
+charts/
+/dispatch_chart.png
+/daily_pnl.png
+
+# OS / editors
+.DS_Store
+.Rhistory
+.vscode/
